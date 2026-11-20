@@ -2,6 +2,7 @@
 # Builds the app and publishes it to your download page over SSH: Un-remarkable-mac.zip, install-mac.sh,
 # mac-version.json (the in-app updater's feed) and the <!--mac-meta--> version line in index.html.
 # Settings come from config.local.env (see config.example.env): DOWNLOAD_URL, PAGES_HOST, PAGES_DIR.
+# With PUBLIC_REPO set it also runs scripts/release-public.sh.
 # Usage: scripts/publish.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -38,3 +39,8 @@ PAGES=("~/$DIR/index.html")
 for p in ${=PAGES_EXTRA_INDEX:-}; do PAGES+=("~/$p"); done
 ssh "$HOST" "for f in ${PAGES[*]}; do [ -f \$f ] && sed -i 's|<!--mac-meta-->.*<!--/mac-meta-->|<!--mac-meta-->$META<!--/mac-meta-->|' \$f; done; true"
 echo "Published Un-remarkable for Mac $VERSION ($SIZE MB) to $DOWNLOAD_URL/"
+
+# Then the public repository, if you have one (PUBLIC_REPO in config.local.env): same version, one commit.
+if [[ -n "${PUBLIC_REPO:-}" ]]; then
+  scripts/release-public.sh || echo "Warning: the public release to $PUBLIC_REPO didn't go out; run scripts/release-public.sh to retry." >&2
+fi

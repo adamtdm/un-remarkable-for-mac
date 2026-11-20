@@ -9,7 +9,7 @@ Native macOS reMarkable companion (Swift 6, SwiftUI, SwiftPM). See README.md for
   with `__DOWNLOAD_URL__` filled in; the page's version lines are `<!--mac-meta-->` markers.
 - Build-time settings from `config.local.env` go into Info.plist: `UnremarkableUpdateFeed` (DOWNLOAD_URL) and
   `UnremarkableCompanionURL` (COMPANION_URL). Never hard-code personal servers, names or accounts in tracked files.
-- Public releases: `scripts/release-public.sh` copies the current commit to PUBLIC_REPO as one squashed commit
+- Public releases: `scripts/publish.sh` ends by running `scripts/release-public.sh` when PUBLIC_REPO is set. It copies the current commit to PUBLIC_REPO as one squashed commit
   (this repo's history stays private) and refuses if any config.local.env value appears in the files.
 - Tests: `scripts/test.sh` (Swift Testing; works with only the Command Line Tools)
 - Debug build: `source scripts/env.sh && swift build`
