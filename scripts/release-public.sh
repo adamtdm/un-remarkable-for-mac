@@ -24,9 +24,9 @@ git archive HEAD | tar -x -C "$WORK/repo"
 if [[ -f config.local.env ]]; then
   for value in $(grep -E '^[A-Z_]+=' config.local.env | grep -v '^PUBLIC_' | cut -d= -f2- | tr -d '"' | tr ' ' '\n'); do
     [[ ${#value} -ge 6 ]] || continue
-    if grep -rIlF -- "$value" "$WORK/repo" --exclude-dir=.git >/dev/null; then
+    if grep -rIlF --exclude-dir=.git -- "$value" "$WORK/repo" >/dev/null; then
       echo "Refusing to publish: \"$value\" from config.local.env appears in:" >&2
-      grep -rIlF -- "$value" "$WORK/repo" --exclude-dir=.git >&2
+      grep -rIlF --exclude-dir=.git -- "$value" "$WORK/repo" >&2
       exit 1
     fi
   done
