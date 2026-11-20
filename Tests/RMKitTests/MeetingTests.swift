@@ -1,0 +1,268 @@
+import AVFAudio
+import ImageIO
+import PDFKit
+import Foundation
+import Testing
+@testable import RMKit
+
+@Suite("meeting")
+struct MeetingTests {
+    @Test func transcriptMergesTurnsAndFormatsTimestamps() {
+        let segs = [
+            TranscriptSegment(speaker: .them, start: 5, end: 7, text: "Can you hear me?"),
+            TranscriptSegment(speaker: .me, start: 0, end: 2, text: "Morning all."),
+            TranscriptSegment(speaker: .me, start: 2.5, end: 4, text: "Let's start."),
+            TranscriptSegment(speaker: .them, start: 65, end: 70, text: "  "),
+            TranscriptSegment(speaker: .them, start: 3700, end: 3702, text: "Bye."),
+        ]
+        #expect(Meeting.formatTranscript(segs) == """
+            [00:00] Me: Morning all. Let's start.
+            [00:05] Them: Can you hear me?
+            [1:01:40] Them: Bye.
+            """)
+    }
+
+    @Test func speakerEchoIsDropped() {
+        var m = Meeting()
+        // Mic echo arriving before the clean system-audio copy is replaced by it.
+        m.appendSegment(TranscriptSegment(speaker: .me, start: 1.0, end: 3, text: "This is a test of system audio capture."))
+        m.appendSegment(TranscriptSegment(speaker: .them, start: 1.9, end: 3, text: "This is a test of system audio capture."))
+        // Echo arriving after is dropped, even if the mic caught only part of it.
+        let keptThem = m.appendSegment(TranscriptSegment(speaker: .them, start: 4.4, end: 6, text: "The design review moves to Monday at 10."))
+        let keptEcho = m.appendSegment(TranscriptSegment(speaker: .me, start: 4.6, end: 6, text: "design review moves to Monday"))
+        #expect(keptThem)
+        #expect(!keptEcho)
+        // Me genuinely replying, and the same words much later, are kept.
+        let keptReply = m.appendSegment(TranscriptSegment(speaker: .me, start: 7, end: 8, text: "Monday works, I'll bring the prototype."))
+        let keptLater = m.appendSegment(TranscriptSegment(speaker: .me, start: 60, end: 62, text: "The design review moves to Monday at 10."))
+        #expect(keptReply)
+        #expect(keptLater)
+        #expect(m.transcript.map(\.speaker) == [.them, .them, .me, .me])
+    }
+
+    /// System audio stops between sounds; a later sentence must still get its real time on the meeting clock.
+    @Test func transcriberFillsGapsBetweenBursts() async throws {
+        guard #available(macOS 26.0, *), LiveTranscriber.isAvailable else { return }
+        let dir = FileManager.default.temporaryDirectory.appending(path: "gap-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func speech(_ text: String, _ name: String) throws -> AVAudioFile {
+            let url = dir.appending(path: name)
+            let say = Process()
+            say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+            say.arguments = ["-v", "Samantha", "-o", url.path, text]
+            try say.run()
+            say.waitUntilExit()
+            return try AVAudioFile(forReading: url)
+        }
+        let first = try speech("Good morning everyone.", "a.aiff")
+        let second = try speech("The budget is approved.", "b.aiff")
+        let start = Date()
+        let t = LiveTranscriber(speaker: .them, meetingStart: start)
+        let collected = Collected()
+        try await t.start(locale: Locale(identifier: "en-US")) { if case .final(let s) = $0 { collected.add(s) } }
+        func play(_ file: AVAudioFile) async throws {
+            let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 10)
+            while file.framePosition < file.length {
+                let buf = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk))
+                try file.read(into: buf, frameCount: chunk)
+                t.append(buf)
+                try await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        try await play(first)
+        try await Task.sleep(for: .seconds(4)) // nothing delivered, like an idle output device
+        try await play(second)
+        await t.stop()
+        let budget = try #require(collected.segments.first { $0.text.lowercased().contains("budget") })
+        // Without gap filling this would be stamped ~1.5 s, right after the first sentence.
+        #expect(budget.start > 3.5)
+    }
+
+    @Test func storeRoundTrip() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: "meetings-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingStore(root: dir)
+        var m = Meeting(title: "Standup")
+        m.transcript = [TranscriptSegment(speaker: .me, start: 1, end: 2, text: "hi")]
+        try store.save(m)
+        #expect(store.load(m.id) == m)
+        #expect(store.all().map(\.id) == [m.id])
+    }
+
+    /// Streams speech generated by `say` through the live transcriber in 100 ms chunks, like a microphone.
+    @Test func liveTranscriberRecognisesStreamedSpeech() async throws {
+        guard #available(macOS 26.0, *), LiveTranscriber.isAvailable else { return }
+        let dir = FileManager.default.temporaryDirectory.appending(path: "speech-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let audio = dir.appending(path: "speech.aiff")
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        // A named voice: the system default can change (e.g. to a Siri voice) and then `say` writes silence.
+        say.arguments = ["-v", "Samantha", "-o", audio.path, "The quarterly budget review is moved to Thursday afternoon. Please send the slides by Wednesday."]
+        try say.run()
+        say.waitUntilExit()
+
+        let file = try AVAudioFile(forReading: audio)
+        try #require(Double(file.length) / file.fileFormat.sampleRate > 2, "say produced no speech; is the Samantha voice installed?")
+        let recording = dir.appending(path: "me.m4a")
+        let transcriber = LiveTranscriber(speaker: .me, meetingStart: Date().addingTimeInterval(-10), recordTo: recording)
+        let collected = Collected()
+        try await transcriber.start(locale: Locale(identifier: "en-US")) { event in
+            if case .final(let s) = event { collected.add(s) }
+        }
+        let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 10)
+        while file.framePosition < file.length {
+            let buf = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: chunk))
+            try file.read(into: buf, frameCount: chunk)
+            transcriber.append(buf)
+        }
+        await transcriber.stop()
+
+        let text = collected.segments.map(\.text).joined(separator: " ").lowercased()
+        #expect(text.contains("budget"))
+        #expect(text.contains("thursday"))
+        #expect(collected.segments.allSatisfy { $0.speaker == .me && $0.start >= 10 })
+        let recorded = try AVAudioFile(forReading: recording)
+        #expect(Double(recorded.length) / recorded.fileFormat.sampleRate > 3)
+    }
+}
+
+@Suite("meeting notes")
+struct MeetingNotesTests {
+    static var sample: Meeting {
+        var m = Meeting(title: "Roadmap sync", startedAt: Date(timeIntervalSince1970: 1_794_500_000))
+        m.duration = 1_860
+        m.myNotes = "Q1 priorities\n- mobile app\nBudget??"
+        var segs: [TranscriptSegment] = []
+        for i in 0..<120 {
+            let speaker: Speaker = i % 3 == 0 ? .me : .them
+            let start = Double(i) * 15
+            let text = "Point \(i): we discussed the mobile app launch timeline and the budget for contractors in some detail."
+            segs.append(TranscriptSegment(speaker: speaker, start: start, end: start + 10, text: text))
+        }
+        m.transcript = segs
+        m.aiNotes = """
+        ## Summary
+        The team agreed the **mobile app** ships in March.
+
+        ## Notes
+        ### Q1 priorities
+        - Mobile app first
+          - Android after iOS
+        1. Hire two contractors
+
+        ## Action items
+        - [ ] Me: send the budget to Finance (Friday)
+        - [x] Them: book the review
+        """
+        return m
+    }
+
+    @Test func promptKeepsMyNotesAsOutline() {
+        let m = Self.sample
+        let p = MeetingNotesGenerator.prompt(meeting: m, notes: m.myNotes, transcript: "[00:00] Me: hi", handwritingPages: 2)
+        #expect(p.contains("## My notes (typed during the meeting)\nQ1 priorities"))
+        #expect(p.contains("2 attached image(s)"))
+        #expect(p.contains("[00:00] Me: hi"))
+        #expect(p.contains("Action items"))
+    }
+
+    @Test func chunkingAndCleanup() {
+        let text = (0..<100).map { "line \($0) with some words" }.joined(separator: "\n")
+        let chunks = MeetingNotesGenerator.chunk(text, size: 300)
+        #expect(chunks.count > 5)
+        #expect(chunks.joined(separator: "\n") == text)
+        #expect(chunks.allSatisfy { $0.count <= 300 })
+        #expect(MeetingNotesGenerator.cleanup("Sure! Here you go:\n```markdown\n## Summary\nOK\n```") == "## Summary\nOK")
+        #expect(MeetingNotesGenerator.cleanup("## Summary\nOK\n\n## Decisions\n- None\n\n## Open questions\n\n") == "## Summary\nOK")
+        #expect(MeetingNotesGenerator.cleanup("## Summary\n\u{200B}\n## Notes\n* Budget\n## Decisions\n* None\n## Action items\n* Me: None\n") == "## Notes\n* Budget")
+    }
+
+    @Test func structuredNotesRenderMarkdownWithoutPlaceholders() {
+        let notes = StructuredMeetingNotes(
+            summary: "Android slips to April.",
+            topics: [.init(title: "Budget", points: ["Two contractors", "None"]), .init(title: "Empty", points: ["n/a"])],
+            decisions: ["Hire two contractors", "None"],
+            actionItems: [.init(owner: "Me", task: "Send the budget to Finance", due: "Friday"), .init(owner: "Me", task: "None", due: nil)],
+            openQuestions: [])
+        #expect(notes.markdown == """
+            ## Summary
+            Android slips to April.
+
+            ## Notes
+            ### Budget
+            - Two contractors
+
+            ## Decisions
+            - Hire two contractors
+
+            ## Action items
+            - [ ] Me: Send the budget to Finance (Friday)
+            """)
+    }
+
+    @Test func pdfHasNotesThenTranscriptPages() throws {
+        let data = MeetingPDF.render(Self.sample)
+        let pdf = try #require(PDFDocument(data: data))
+        #expect(pdf.pageCount >= 3)
+        let first = pdf.page(at: 0)?.string ?? ""
+        #expect(first.contains("Roadmap sync"))
+        #expect(first.contains("mobile app ships in March"))
+        #expect(first.contains("send the budget to Finance"))
+        #expect(!first.contains("Point 0:"))
+        #expect((pdf.page(at: 1)?.string ?? "").contains("Transcript"))
+        #expect((pdf.page(at: pdf.pageCount - 1)?.string ?? "").contains("Point 119"))
+
+        if let dir = ProcessInfo.processInfo.environment["RMKIT_RENDER_DIR"] {
+            try data.write(to: URL(fileURLWithPath: dir).appending(path: "meeting.pdf"))
+        }
+    }
+}
+
+/// Live check against Apple's on-device model. Run with RMKIT_APPLE_AI=1 once Apple Intelligence is on.
+@Suite("apple intelligence", .enabled(if: ProcessInfo.processInfo.environment["RMKIT_APPLE_AI"] != nil))
+struct AppleIntelligenceTests {
+    static var provider: AIProvider {
+        var settings = AISettings()
+        settings.provider = .apple
+        return AIProvider(settings: settings, apiKey: "")
+    }
+
+    @Test func shortMeetingNotes() async throws {
+        var m = Meeting(title: "Roadmap sync")
+        m.duration = 30
+        m.myNotes = "budget\nandroid date?"
+        m.transcript = [
+            TranscriptSegment(speaker: .me, start: 0, end: 4, text: "Morning everyone. Thanks for joining the roadmap sync. I want to cover the mobile app launch and the contractor budget."),
+            TranscriptSegment(speaker: .them, start: 9, end: 18, text: "From the engineering side, the iOS app is on track for March, but Android will slip to April because we are short one developer. We decided to hire two contractors."),
+            TranscriptSegment(speaker: .me, start: 19, end: 22, text: "I'll send the updated budget to finance by Friday."),
+            TranscriptSegment(speaker: .them, start: 23, end: 25, text: "Can you confirm the budget covers that?"),
+        ]
+        let notes = try await MeetingNotesGenerator(provider: Self.provider).generate(m)
+        print("APPLE SHORT NOTES\n\(notes)\nEND")
+        #expect(notes.hasPrefix("## Summary"))
+        #expect(notes.localizedCaseInsensitiveContains("april"))
+        #expect(notes.localizedCaseInsensitiveContains("friday"))
+    }
+
+    @Test func longMeetingIsChunked() async throws {
+        let m = MeetingNotesTests.sample
+        #expect(m.transcriptText.count > AIProviderKind.apple.promptBudget)
+        let steps = Collected()
+        let notes = try await MeetingNotesGenerator(provider: Self.provider).generate(m) { message in
+            steps.add(TranscriptSegment(speaker: .me, start: 0, end: 0, text: message))
+        }
+        print("APPLE LONG NOTES (\(steps.segments.count) steps)\n\(notes)\nEND")
+        #expect(steps.segments.count > 2)
+        #expect(notes.hasPrefix("## Summary"))
+    }
+}
+
+final class Collected: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [TranscriptSegment] = []
+    func add(_ s: TranscriptSegment) { lock.withLock { items.append(s) } }
+    var segments: [TranscriptSegment] { lock.withLock { items } }
+}

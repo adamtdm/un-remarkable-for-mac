@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+dist/
+*.xcodeproj/xcuserdata/
+.DS_Store
+# Reference material (cloned repos and the official app), kept local only
+_ref/
+reMarkable.app/
+# Your own build/publish settings (see config.example.env)
+config.local.env
+# Local design tooling
+.claude/
+.impeccable/
